@@ -268,8 +268,7 @@ public class Main
                 DataOutputStream output = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(outputFile.get())));
                 output.write(new byte[]{'T', 'D', 's', 'u', 'm', 's', 0x00, 0x01});
                 String alg = hash.get().getAlgorithm();
-                output.writeShort(alg.length());
-                output.writeChars(alg);
+                output.writeUTF(alg);
                 output.writeInt(hashLength.get());
                 checksum(hash.get(), hashLength.get(), output, Arrays.asList(argv).subList(getopt.getOptind(), argv.length));
                 output.close();
@@ -333,6 +332,12 @@ public class Main
         builder.strongSumLength(hashLength);
         FileVisitor<Path> visitor = new SimpleFileVisitor<Path>()
         {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException
+            {
+                return visitFile(dir, attrs);
+            }
+
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException
             {
