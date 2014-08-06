@@ -369,6 +369,7 @@ public class Main
         Configuration.Builder builder = Configuration.Builder.create();
         builder.strongSum(hash);
         builder.strongSumLength(hashLength);
+
         FileVisitor<Path> visitor = new SimpleFileVisitor<Path>()
         {
             @Override
@@ -537,6 +538,8 @@ public class Main
             }
             else if (file.isDirectory())
             {
+                output.write('r');
+                output.writeUTF(path.toFile().getAbsolutePath());
                 Files.walkFileTree(path, visitor);
             }
             else
@@ -595,14 +598,29 @@ public class Main
             throw new IOException("file format error");
     }
 
+    static List<String> toList(Path p)
+    {
+        List<String> l = new ArrayList<>();
+        for (Path aP : p) l.add(aP.toString());
+        return l;
+    }
+
     static void diff(MessageDigest hash, int hashLength, DataInputStream input, DataOutputStream output, DiffCheck check) throws IOException, NoSuchAlgorithmException
     {
         Configuration.Builder builder = Configuration.Builder.create();
         builder.strongSum(hash);
         builder.strongSumLength(hashLength);
+        Set<Path> roots = new HashSet<>();
+        PathTrie visited = new PathTrie();
         int ch;
         while ((ch = input.read()) != -1)
         {
+            if (ch == 'r')
+            {
+                roots.add(Paths.get(input.readUTF()));
+                continue;
+            }
+
             if (ch != 'd' && ch != 'f' && ch != 'l')
                 throw new IOException(String.format("invalid tag: %02x", ch));
             String owner = input.readUTF();
@@ -612,6 +630,7 @@ public class Main
             FileTime modified = FileTime.from(input.readLong(), TimeUnit.SECONDS);
             long fileSize = input.readLong();
             Path path = Paths.get(input.readUTF());
+            visited.add(toList(path));
 
             if (verbosity > 1)
             {
@@ -927,6 +946,71 @@ public class Main
                         output.writeUTF(path.toFile().getAbsolutePath());
                     }
                 }
+            }
+        }
+
+        // Now, find any files that exist in our local roots that we haven't already visited.
+        for (Path root : roots)
+        {
+            BasicFileAttributes attr;
+            try
+            {
+                attr = Files.readAttributes(root, BasicFileAttributes.class);
+            }
+            catch (Exception x)
+            {
+                continue;
+            }
+
+            if (attr.isDirectory())
+            {
+                Files.walk(root).filter(e -> !visited.contains(toList(e))).forEach(file -> {
+                    try
+                    {
+                        PosixFileAttributes posixAttrs = Files.getFileAttributeView(file, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS).readAttributes();
+                        if (verbosity > 0)
+                            System.out.printf("%s: visiting new file not from sums.%n", file);
+                        if (posixAttrs.isRegularFile())
+                        {
+                            output.write('F');
+                            output.writeUTF(posixAttrs.owner().getName());
+                            output.writeUTF(posixAttrs.group().getName());
+                            output.writeShort(permBits(posixAttrs.permissions()));
+                            writeFileAttributes(file, posixAttrs, output);
+                            output.writeUTF(file.toFile().getAbsolutePath());
+                            InputStream in = Files.newInputStream(file, StandardOpenOption.READ);
+                            long total = Files.size(file);
+                            int read;
+                            byte[] buffer = new byte[4096];
+                            while ((read = in.read(buffer, 0, (int) Math.min(buffer.length, total))) >= 0 && total > 0)
+                            {
+                                output.write(buffer, 0, read);
+                                total -= read;
+                            }
+                        } else if (posixAttrs.isSymbolicLink())
+                        {
+                            output.write('L');
+                            output.writeUTF(posixAttrs.owner().getName());
+                            output.writeUTF(posixAttrs.group().getName());
+                            output.writeShort(permBits(posixAttrs.permissions()));
+                            writeFileAttributes(file, posixAttrs, output);
+                            output.writeUTF(file.toFile().getAbsolutePath());
+                            output.writeUTF(Files.readSymbolicLink(file).toFile().getPath());
+                        } else if (posixAttrs.isDirectory())
+                        {
+                            output.write('D');
+                            output.writeUTF(posixAttrs.owner().getName());
+                            output.writeUTF(posixAttrs.group().getName());
+                            output.writeShort(permBits(posixAttrs.permissions()));
+                            writeFileAttributes(file, posixAttrs, output);
+                            output.writeUTF(file.toFile().getAbsolutePath());
+                        }
+                    }
+                    catch (IOException ioe)
+                    {
+                        throw new RuntimeException(ioe);
+                    }
+                });
             }
         }
     }

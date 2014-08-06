@@ -57,13 +57,16 @@ while True:
         while True:
             y = sys.stdin.read(1)
             if y[0] == 'o':
-                print 'Copy command len=%d oldoffset=%d newoffset=%d' % (readint(sys.stdin), readlong(sys.stdin),
-                                                                         readlong(sys.stdin))
+                blocklen = readint(sys.stdin)
+                oldoff = readlong(sys.stdin)
+                newoff = readlong(sys.stdin)
+                print '    Copy command len=%d oldoffset=%d newoffset=%d' % (blocklen, oldoff, newoff)
             elif y[0] == 'd':
                 l = readint(sys.stdin)
-                print 'Data command len=%d offset=%d data=%s' % (l, readlong(sys.stdin),
-                                                                 base64.b64encode(sys.stdin.read(l)[0:32]))
-            elif y[0] == 0:
+                offset = readlong(sys.stdin)
+                data = sys.stdin.read(l)
+                print '    Data command len=%d offset=%d data=%s' % (l, offset, base64.b64encode(data[0:32]))
+            elif ord(y[0]) == 0:
                 break
             else:
                 print 'invalid patch command %x' % ord(y[0])

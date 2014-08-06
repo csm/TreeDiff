@@ -36,7 +36,9 @@ while True:
     x = sys.stdin.read(1)
     if len(x) < 1:
         break
-    if x[0] == 'f':
+    if x[0] == 'r':
+        print 'Root:', readutf(sys.stdin)
+    elif x[0] == 'f':
         print 'File entry'
         print '  User:', readutf(sys.stdin)
         print '  Group:', readutf(sys.stdin)
