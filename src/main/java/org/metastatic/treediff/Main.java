@@ -44,13 +44,12 @@ import org.metastatic.rsync.*;
 
 import java.io.*;
 import java.nio.file.*;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.nio.file.attribute.PosixFileAttributeView;
-import java.nio.file.attribute.PosixFileAttributes;
-import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.*;
+import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 public class Main
 {
@@ -59,6 +58,8 @@ public class Main
     static final int PATCH = 0x10000 | 'p';
     static final int HELP = 0x10000 | 'h';
     static final int VERSION = 0x10000 | 'v';
+    private static final byte[] SUMS_MAGIC = new byte[]{'T', 'D', 's', 'u', 'm', 's', 0x00, 0x01};
+    private static final byte[] DIFF_MAGIC = new byte[]{'T', 'D', 'd', 'i', 'f', 'f', 0x00, 0x01};
 
     static int verbosity = 0;
 
@@ -77,6 +78,11 @@ public class Main
         {
             return option;
         }
+    }
+
+    static enum DiffCheck
+    {
+        SizeOnly, SizeAndTime, StrictHash;
     }
 
     static void checkCommand(String option, Optional<Command> command, EnumSet<Command> expect)
@@ -119,6 +125,8 @@ public class Main
             new LongOpt("diff-file", LongOpt.REQUIRED_ARGUMENT, null, 'd'),
             new LongOpt("output", LongOpt.REQUIRED_ARGUMENT, null, 'o'),
             new LongOpt("verbose", LongOpt.NO_ARGUMENT, null, 'v'),
+            new LongOpt("strict-hash", LongOpt.NO_ARGUMENT, null, 'H'),
+            new LongOpt("size-only", LongOpt.NO_ARGUMENT, null, 'S'),
             new LongOpt("help", LongOpt.NO_ARGUMENT, null, HELP),
             new LongOpt("version", LongOpt.NO_ARGUMENT, null, VERSION)
         };
@@ -126,7 +134,8 @@ public class Main
         Optional<Integer> hashLength = Optional.absent();
         Optional<String> inputFile = Optional.absent();
         Optional<String> outputFile = Optional.absent();
-        Getopt getopt = new Getopt(Main.class.getName(), argv, "h:l:s:d:o:v", longOpts);
+        Optional<DiffCheck> diffCheck = Optional.of(DiffCheck.SizeAndTime);
+        Getopt getopt = new Getopt(Main.class.getName(), argv, "h:l:s:d:o:vH", longOpts);
         int ch;
         while ((ch = getopt.getopt()) != -1)
         {
@@ -225,6 +234,16 @@ public class Main
                     verbosity++;
                     break;
 
+                case 'H':
+                    checkCommand("--strict-hash", command, EnumSet.of(Command.Diff));
+                    diffCheck = Optional.of(DiffCheck.StrictHash);
+                    break;
+
+                case 'S':
+                    checkCommand("--size-only", command, EnumSet.of(Command.Diff));
+                    diffCheck = Optional.of(DiffCheck.SizeOnly);
+                    break;
+
                 case '?':
                     System.err.printf("Try `%s --help' for more info.%n", Main.class.getName());
                     System.exit(1);
@@ -266,7 +285,7 @@ public class Main
                     return;
                 }
                 DataOutputStream output = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(outputFile.get())));
-                output.write(new byte[]{'T', 'D', 's', 'u', 'm', 's', 0x00, 0x01});
+                output.write(SUMS_MAGIC);
                 String alg = hash.get().getAlgorithm();
                 output.writeUTF(alg);
                 output.writeInt(hashLength.get());
@@ -276,53 +295,69 @@ public class Main
             }
 
             case Diff:
+            {
+                if (!inputFile.isPresent())
+                {
+                    System.err.printf("%s: --diff: option --sums-file required.%n", Main.class.getName());
+                    System.exit(1);
+                    return;
+                }
+                if (!outputFile.isPresent())
+                {
+                    System.err.printf("%s: --output argument required.%n", Main.class.getName());
+                    System.exit(1);
+                    return;
+                }
+                DataInputStream input = new DataInputStream(new FileInputStream(inputFile.get()));
+                byte[] magic = new byte[8];
+                input.readFully(magic);
+                if (!Arrays.equals(magic, SUMS_MAGIC))
+                {
+                    System.err.printf("%s: %s: invalid file header.%n", Main.class.getName(), inputFile.get());
+                    System.exit(1);
+                    return;
+                }
+                String alg = input.readUTF();
+                try
+                {
+                    hash = Optional.of(MessageDigest.getInstance(alg, new JarsyncProvider()));
+                }
+                catch (NoSuchAlgorithmException nsae)
+                {
+                    hash = Optional.of(MessageDigest.getInstance(alg));
+                }
+                hashLength = Optional.of(input.readInt());
+                if (hashLength.get() <= 0 || hashLength.get() > hash.get().getDigestLength())
+                {
+                    System.err.printf("%s: invalid hash length: %d.%n", Main.class.getName(), hashLength.get());
+                    System.exit(1);
+                    return;
+                }
+                DataOutputStream output = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(outputFile.get())));
+                output.write(DIFF_MAGIC);
+                output.writeUTF(alg);
+                output.writeInt(hashLength.get());
+                diff(hash.get(), hashLength.get(), input, output, diffCheck.or(DiffCheck.SizeAndTime));
+                break;
+            }
 
             case Patch:
         }
     }
 
-    static String permString(Set<PosixFilePermission> perms)
+    static short permBits(Set<PosixFilePermission> perms)
     {
-        StringBuilder s = new StringBuilder();
-        if (perms.contains(PosixFilePermission.OWNER_READ))
-            s.append('r');
-        else
-            s.append('-');
-        if (perms.contains(PosixFilePermission.OWNER_WRITE))
-            s.append('w');
-        else
-            s.append('-');
-        if (perms.contains(PosixFilePermission.OWNER_EXECUTE))
-            s.append('x');
-        else
-            s.append('-');
-
-        if (perms.contains(PosixFilePermission.GROUP_READ))
-            s.append('r');
-        else
-            s.append('-');
-        if (perms.contains(PosixFilePermission.GROUP_WRITE))
-            s.append('w');
-        else
-            s.append('-');
-        if (perms.contains(PosixFilePermission.GROUP_EXECUTE))
-            s.append('x');
-        else
-            s.append('-');
-
-        if (perms.contains(PosixFilePermission.OTHERS_READ))
-            s.append('r');
-        else
-            s.append('-');
-        if (perms.contains(PosixFilePermission.OTHERS_WRITE))
-            s.append('w');
-        else
-            s.append('-');
-        if (perms.contains(PosixFilePermission.OTHERS_EXECUTE))
-            s.append('x');
-        else
-            s.append('-');
-        return s.toString();
+        short result = 0;
+        if (perms.contains(PosixFilePermission.OWNER_READ)) result |= 1 << 8;
+        if (perms.contains(PosixFilePermission.OWNER_WRITE)) result |= 1 << 7;
+        if (perms.contains(PosixFilePermission.OWNER_EXECUTE)) result |= 1 << 6;
+        if (perms.contains(PosixFilePermission.GROUP_READ)) result |= 1 << 5;
+        if (perms.contains(PosixFilePermission.GROUP_WRITE)) result |= 1 << 4;
+        if (perms.contains(PosixFilePermission.GROUP_EXECUTE)) result |= 1 << 3;
+        if (perms.contains(PosixFilePermission.OTHERS_READ)) result |= 1 << 2;
+        if (perms.contains(PosixFilePermission.OTHERS_WRITE)) result |= 1 << 1;
+        if (perms.contains(PosixFilePermission.OTHERS_EXECUTE)) result |= 1;
+        return result;
     }
 
     static void checksum(MessageDigest hash, int hashLength, DataOutputStream output, List<String> f) throws IOException
@@ -343,7 +378,8 @@ public class Main
             {
                 if (verbosity > 0)
                     System.out.printf("visiting file: %s%n", file.toFile().getAbsolutePath());
-                String user = "", group = "", permissions = "??????";
+                String user = "", group = "";
+                short permissions = 0;
                 try
                 {
                     PosixFileAttributes posixAttr = null;
@@ -353,7 +389,7 @@ public class Main
                         posixAttr = Files.getFileAttributeView(file, PosixFileAttributeView.class).readAttributes();
                     user = posixAttr.owner().getName();
                     group = posixAttr.group().getName();
-                    permissions = permString(posixAttr.permissions());
+                    permissions = permBits(posixAttr.permissions());
                 }
                 catch (Exception x)
                 {
@@ -364,7 +400,7 @@ public class Main
                 {
                     // Format is:
                     // 'f'
-                    // user, group, permissions
+                    // user, group, permissions, file size
                     // file path, UTF-8 (length + bytes)
                     // block length
                     // 's' weakSum, strongSum, offset, length
@@ -372,7 +408,11 @@ public class Main
                     output.write('f');
                     output.writeUTF(user);
                     output.writeUTF(group);
-                    output.writeUTF(permissions);
+                    output.writeShort(permissions);
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(file));
                     output.writeUTF(file.toFile().getAbsolutePath());
                     // Choose a block size.
                     int blockLength = 0;
@@ -401,9 +441,18 @@ public class Main
                             throw new ListenerException(e);
                         }
                     });
+                    MessageDigest fileHash;
+                    try
+                    {
+                        fileHash = MessageDigest.getInstance("MD5");
+                    }
+                    catch (NoSuchAlgorithmException e)
+                    {
+                        throw new IOException(e);
+                    }
                     byte[] buffer = new byte[4096];
                     int read = 0;
-                    FileInputStream in = new FileInputStream(file.toFile());
+                    DigestInputStream in = new DigestInputStream(new FileInputStream(file.toFile()), fileHash);
                     while ((read = in.read(buffer)) > 0)
                     {
                         try
@@ -429,6 +478,8 @@ public class Main
                             throw (IOException) cause;
                         throw new IOException(e);
                     }
+                    output.write('i');
+                    output.write(fileHash.digest());
                     output.write(0);
                 }
                 else if (attrs.isSymbolicLink())
@@ -436,7 +487,11 @@ public class Main
                     output.write('l');
                     output.writeUTF(user);
                     output.writeUTF(group);
-                    output.writeUTF(permissions);
+                    output.writeShort(permissions);
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(file));
                     output.writeUTF(file.toFile().getAbsolutePath());
                     String target = Files.readSymbolicLink(file).toFile().getPath();
                     output.writeUTF(target);
@@ -451,7 +506,11 @@ public class Main
                     output.write('d');
                     output.writeUTF(user);
                     output.writeUTF(group);
-                    output.writeUTF(permissions);
+                    output.writeShort(permissions);
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(file));
                     output.writeUTF(file.toFile().getAbsolutePath());
                 }
                 else
@@ -480,6 +539,369 @@ public class Main
         }
     }
 
+    static EnumSet<PosixFilePermission> getPerms(short permBits)
+    {
+        EnumSet<PosixFilePermission> perms = EnumSet.noneOf(PosixFilePermission.class);
+        if ((permBits & (1 << 8)) != 0)
+            perms.add(PosixFilePermission.OWNER_READ);
+        if ((permBits & (1 << 7)) != 0)
+            perms.add(PosixFilePermission.OWNER_WRITE);
+        if ((permBits & (1 << 6)) != 0)
+            perms.add(PosixFilePermission.OWNER_EXECUTE);
+        if ((permBits & (1 << 5)) != 0)
+            perms.add(PosixFilePermission.GROUP_READ);
+        if ((permBits & (1 << 4)) != 0)
+            perms.add(PosixFilePermission.GROUP_WRITE);
+        if ((permBits & (1 << 3)) != 0)
+            perms.add(PosixFilePermission.GROUP_EXECUTE);
+        if ((permBits & (1 << 2)) != 0)
+            perms.add(PosixFilePermission.OTHERS_READ);
+        if ((permBits & (1 << 1)) != 0)
+            perms.add(PosixFilePermission.OTHERS_WRITE);
+        if ((permBits &       1)  != 0)
+            perms.add(PosixFilePermission.OTHERS_EXECUTE);
+        return perms;
+    }
+
+    static void skipSums(DataInputStream input, int hashLength) throws IOException
+    {
+        int c;
+        while ((c = input.read()) == 's')
+            input.skipBytes(4 + hashLength + 8 + 8);
+        if (c == 'i')
+        {
+            input.skipBytes(16);
+            c = input.read();
+        }
+        if (c != 0)
+            throw new IOException("file format error");
+    }
+
+    static void diff(MessageDigest hash, int hashLength, DataInputStream input, DataOutputStream output, DiffCheck check) throws IOException, NoSuchAlgorithmException
+    {
+        Configuration.Builder builder = Configuration.Builder.create();
+        builder.strongSum(hash);
+        builder.strongSumLength(hashLength);
+        int ch;
+        while ((ch = input.read()) != -1)
+        {
+            if (ch != 'd' && ch != 'f' && ch != 'l')
+                throw new IOException(String.format("invalid tag: %02x", ch));
+            String owner = input.readUTF();
+            String group = input.readUTF();
+            EnumSet<PosixFilePermission> perms = getPerms(input.readShort());
+            FileTime created = FileTime.fromMillis(input.readLong());
+            FileTime modified = FileTime.fromMillis(input.readLong());
+            FileTime accessed = FileTime.fromMillis(input.readLong());
+            long fileSize = input.readLong();
+            Path path = Paths.get(input.readUTF());
+
+            if (!path.toFile().exists())
+            {
+                // Delete
+                output.write('X');
+                output.writeUTF(path.toFile().getPath());
+                if (ch == 'f')
+                {
+                    input.readInt(); // skip block length
+                    skipSums(input, hashLength);
+                }
+                else if (ch == 'l')
+                    input.readUTF(); // skip link target
+                continue;
+            }
+
+            if (ch == 'f')
+            {
+                int blockLength = input.readInt();
+                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class).readAttributes();
+                if (attrs.isRegularFile())
+                {
+                    if (check == DiffCheck.SizeOnly && fileSize == Files.size(path))
+                    {
+                        if (verbosity > 0)
+                            System.out.printf("%s: skipping file, file sizes match.%n", path.toFile());
+                        skipSums(input, hashLength);
+                    }
+                    if (check == DiffCheck.SizeAndTime && fileSize == Files.size(path) && modified.equals(attrs.lastModifiedTime()))
+                    {
+                        if (verbosity > 0)
+                            System.out.printf("%s: skipping file, file sizes and times match.%n", path.toFile());
+                        skipSums(input, hashLength);
+                    }
+
+                    List<ChecksumLocation> locations = new ArrayList<>();
+                    int c;
+                    while ((c = input.read()) == 's')
+                    {
+                        int weak = input.readInt();
+                        byte[] strong = new byte[hashLength];
+                        input.readFully(strong);
+                        long offset = input.readLong();
+                        long length = input.readLong();
+                        locations.add(new ChecksumLocation(new ChecksumPair(weak, strong), offset, (int) length));
+                    }
+                    byte[] fileDigest = new byte[16];
+                    if (c == 'i')
+                    {
+                        input.readFully(fileDigest);
+                        c = input.read();
+                        if (check == DiffCheck.StrictHash)
+                        {
+                            MessageDigest fileHash = MessageDigest.getInstance("MD5");
+                            InputStream in = Files.newInputStream(path, StandardOpenOption.READ);
+                            byte[] buffer = new byte[4096];
+                            int read;
+                            while ((read = in.read(buffer)) >= 0)
+                                fileHash.update(buffer, 0, read);
+                            byte[] digest2 = fileHash.digest();
+                            if (Arrays.equals(fileDigest, digest2))
+                            {
+                                if (verbosity > 0)
+                                    System.out.printf("%s: skipping file, file MD5 matches.%n", path.toFile());
+                                continue;
+                            }
+                        }
+                    }
+                    if (c != 0)
+                        throw new IOException(String.format("invalid sum tag: %02x", c));
+
+                    // write a patch command
+                    output.write('p');
+                    output.writeUTF(attrs.owner().getName());
+                    output.writeUTF(attrs.group().getName());
+                    output.writeShort(permBits(attrs.permissions()));
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(path));
+                    output.writeUTF(path.toFile().getAbsolutePath());
+                    MatcherStream matcherStream = new MatcherStream(builder.blockLength(blockLength).build());
+                    matcherStream.addListener((event) -> {
+                        Delta delta = event.getDelta();
+                        if (delta instanceof Offsets)
+                        {
+                            try
+                            {
+                                output.write('o');
+                                output.writeInt(((Offsets) delta).getBlockLength());
+                                output.writeLong(((Offsets) delta).getOldOffset());
+                                output.writeLong(((Offsets) delta).getNewOffset());
+                            }
+                            catch (IOException e)
+                            {
+                                throw new ListenerException(e);
+                            }
+                        }
+                        else if (delta instanceof DataBlock)
+                        {
+                            try
+                            {
+                                output.write('d');
+                                output.writeInt(((DataBlock) delta).getBlockLength());
+                                output.writeLong(((DataBlock) delta).getOffset());
+                                output.write(((DataBlock) delta).getData());
+                            }
+                            catch (IOException e)
+                            {
+                                throw new ListenerException(e);
+                            }
+                        }
+                    });
+                    matcherStream.setChecksums(locations);
+                    FileInputStream in = new FileInputStream(path.toFile());
+                    byte[] buffer = new byte[4096];
+                    int read;
+                    while ((read = in.read(buffer)) > 0)
+                    {
+                        try
+                        {
+                            matcherStream.update(buffer, 0, read);
+                        }
+                        catch (ListenerException e)
+                        {
+                            if (e.getCause() instanceof IOException)
+                                throw (IOException) e.getCause();
+                            throw new IOException(e);
+                        }
+                    }
+                    try
+                    {
+                        matcherStream.doFinal();
+                    }
+                    catch (ListenerException e)
+                    {
+                        if (e.getCause() instanceof IOException)
+                            throw (IOException) e.getCause();
+                        throw new IOException(e);
+                    }
+                    output.write(0);
+                }
+                else if (attrs.isSymbolicLink())
+                {
+                    // Emit command to overwrite any -> symlink
+                    output.write('L');
+                    output.writeUTF(attrs.owner().getName());
+                    output.writeUTF(attrs.group().getName());
+                    output.writeShort(permBits(attrs.permissions()));
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(path));
+                    output.writeUTF(path.toFile().getAbsolutePath());
+                    output.writeUTF(Files.readSymbolicLink(path).toFile().getPath());
+                    skipSums(input, hashLength);
+                }
+                else if (attrs.isDirectory())
+                {
+                    // Emit command to overwrite any -> directory
+                    output.write('D');
+                    output.writeUTF(attrs.owner().getName());
+                    output.writeUTF(attrs.group().getName());
+                    output.writeShort(permBits(attrs.permissions()));
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(path));
+                    output.writeUTF(path.toFile().getAbsolutePath());
+                    skipSums(input, hashLength);
+                }
+                else
+                {
+                    if (verbosity > 0)
+                        System.out.printf("%s: skipping file, not a file, directory, or link.%n", path.toFile());
+                }
+            }
+            else if (ch == 'l')
+            {
+                Path target = Paths.get(input.readUTF());
+                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class).readAttributes();
+                if (attrs.isRegularFile())
+                {
+                    // New file, overwriting a symlink.
+                    output.write('F');
+                    output.writeUTF(attrs.owner().getName());
+                    output.writeUTF(attrs.group().getName());
+                    output.writeShort(permBits(attrs.permissions()));
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(path));
+                    output.writeUTF(path.toFile().getAbsolutePath());
+                    InputStream in = Files.newInputStream(path, StandardOpenOption.READ);
+                    long total = Files.size(path);
+                    int read;
+                    byte[] buffer = new byte[4096];
+                    while ((read = in.read(buffer, 0, (int) Math.min(buffer.length, total))) >= 0 && total > 0)
+                    {
+                        output.write(buffer, 0, read);
+                        total -= read;
+                    }
+                }
+                else if (attrs.isSymbolicLink())
+                {
+                    Path otherTarget = Files.readSymbolicLink(path);
+                    if (!target.equals(otherTarget) || !owner.equals(attrs.owner().getName())
+                        || !group.equals(attrs.group().getName())
+                        || !perms.equals(attrs.permissions())
+                        || !modified.equals(attrs.lastModifiedTime())
+                        || !created.equals(attrs.creationTime())
+                        || !accessed.equals(attrs.lastAccessTime()))
+                    {
+                        if (verbosity > 0)
+                            System.out.printf("%s: update link target to %s.%n", path.toFile(), otherTarget);
+                        output.write('L');
+                        output.writeUTF(attrs.owner().getName());
+                        output.writeUTF(attrs.group().getName());
+                        output.writeShort(permBits(attrs.permissions()));
+                        output.writeLong(attrs.creationTime().toMillis());
+                        output.writeLong(attrs.lastModifiedTime().toMillis());
+                        output.writeLong(attrs.lastAccessTime().toMillis());
+                        output.writeLong(Files.size(path));
+                        output.writeUTF(path.toFile().getAbsolutePath());
+                        output.writeUTF(otherTarget.toFile().getPath());
+                    }
+                    else
+                    {
+                        if (verbosity > 0)
+                            System.out.printf("%s: not updating link.%n", path.toFile());
+                    }
+                }
+                else if (attrs.isDirectory())
+                {
+                    output.write('D');
+                    output.writeUTF(attrs.owner().getName());
+                    output.writeUTF(attrs.group().getName());
+                    output.writeShort(permBits(attrs.permissions()));
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(path));
+                    output.writeUTF(path.toFile().getAbsolutePath());
+                }
+            }
+            else if (ch == 'd')
+            {
+                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class).readAttributes();
+                if (attrs.isRegularFile())
+                {
+                    // New file, overwriting a directory.
+                    output.write('F');
+                    output.writeUTF(attrs.owner().getName());
+                    output.writeUTF(attrs.group().getName());
+                    output.writeShort(permBits(attrs.permissions()));
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(path));
+                    output.writeUTF(path.toFile().getAbsolutePath());
+                    InputStream in = Files.newInputStream(path, StandardOpenOption.READ);
+                    long total = Files.size(path);
+                    int read;
+                    byte[] buffer = new byte[4096];
+                    while ((read = in.read(buffer, 0, (int) Math.min(buffer.length, total))) >= 0 && total > 0)
+                    {
+                        output.write(buffer, 0, read);
+                        total -= read;
+                    }
+                }
+                else if (attrs.isSymbolicLink())
+                {
+                    output.write('L');
+                    output.writeUTF(attrs.owner().getName());
+                    output.writeUTF(attrs.group().getName());
+                    output.writeShort(permBits(attrs.permissions()));
+                    output.writeLong(attrs.creationTime().toMillis());
+                    output.writeLong(attrs.lastModifiedTime().toMillis());
+                    output.writeLong(attrs.lastAccessTime().toMillis());
+                    output.writeLong(Files.size(path));
+                    output.writeUTF(path.toFile().getAbsolutePath());
+                    output.writeUTF(Files.readSymbolicLink(path).toFile().getPath());
+                }
+                else if (attrs.isDirectory())
+                {
+                    if (!owner.equals(attrs.owner().getName())
+                        || !group.equals(attrs.group().getName())
+                        || !perms.equals(attrs.permissions())
+                        || !modified.equals(attrs.lastModifiedTime())
+                        || !created.equals(attrs.creationTime())
+                        || !accessed.equals(attrs.lastAccessTime()))
+                    {
+                        output.write('D');
+                        output.writeUTF(attrs.owner().getName());
+                        output.writeUTF(attrs.group().getName());
+                        output.writeShort(permBits(attrs.permissions()));
+                        output.writeLong(attrs.creationTime().toMillis());
+                        output.writeLong(attrs.lastModifiedTime().toMillis());
+                        output.writeLong(attrs.lastAccessTime().toMillis());
+                        output.writeLong(Files.size(path));
+                        output.writeUTF(path.toFile().getAbsolutePath());
+                    }
+                }
+            }
+        }
+    }
+
     static void help()
     {
         System.out.printf("usage: %s <command> [options] [list of directories...]%n%n" +
@@ -495,6 +917,9 @@ public class Main
                           "  --sums-file=FILE, -s    Checksum input file, for --diff.%n" +
                           "  --diff-file=FILE, -d    Difference input file, for --patch.%n" +
                           "  --output=FILE, -o       Output file location, for --checksum and --diff.%n" +
+                          "  --strict-hash, -H       Compute file MD5 to determine if diffs should be generated.%n" +
+                          "  --size-only, -S         Only check file size when determining to generate diffs.%n" +
+                          "                          The default behavior is to check the file size and modification times.%n" +
                           "  --verbose, -v           Increase verbosity.%n%n",
                 Main.class.getName());
     }
