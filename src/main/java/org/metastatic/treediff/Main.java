@@ -338,10 +338,12 @@ public class Main
                 output.writeUTF(alg);
                 output.writeInt(hashLength.get());
                 diff(hash.get(), hashLength.get(), input, output, diffCheck.or(DiffCheck.SizeAndTime));
+                output.close();
                 break;
             }
 
             case Patch:
+                throw new Error("not yet implemented");
         }
     }
 
@@ -596,9 +598,17 @@ public class Main
             long fileSize = input.readLong();
             Path path = Paths.get(input.readUTF());
 
+            if (verbosity > 1)
+            {
+                System.out.printf("tag: %c, owner: %s, group: %s, perms: %s, created: %s, modified: %s, accessed: %s, size: %d, path: %s%n",
+                        (char) ch, owner, group, perms, created, modified, accessed, fileSize, path.toFile());
+            }
+
             if (!path.toFile().exists())
             {
                 // Delete
+                if (verbosity > 0)
+                    System.out.printf("%s: file does not exist, emitting delete.%n", path.toFile());
                 output.write('X');
                 output.writeUTF(path.toFile().getPath());
                 if (ch == 'f')
@@ -622,12 +632,14 @@ public class Main
                         if (verbosity > 0)
                             System.out.printf("%s: skipping file, file sizes match.%n", path.toFile());
                         skipSums(input, hashLength);
+                        continue;
                     }
                     if (check == DiffCheck.SizeAndTime && fileSize == Files.size(path) && modified.equals(attrs.lastModifiedTime()))
                     {
                         if (verbosity > 0)
                             System.out.printf("%s: skipping file, file sizes and times match.%n", path.toFile());
                         skipSums(input, hashLength);
+                        continue;
                     }
 
                     List<ChecksumLocation> locations = new ArrayList<>();
