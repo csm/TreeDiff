@@ -1,0 +1,4 @@
+This is a binary diff/patch program, meant to deal with an entire tree of files.
+
+It's mostly an experiment right now; check out [Jarsync](http://github.com/csm/Jarsync) if you're interested in
+something a little more useful.
