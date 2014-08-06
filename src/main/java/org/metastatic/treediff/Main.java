@@ -37,10 +37,8 @@ exception statement from your version.  */
 
 package org.metastatic.treediff;
 
-import com.google.common.base.Optional;
 import gnu.getopt.Getopt;
 import gnu.getopt.LongOpt;
-import org.metastatic.rsync.*;
 
 import java.io.*;
 import java.nio.file.*;
@@ -50,6 +48,10 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.google.common.base.Optional;
+import org.metastatic.rsync.*;
 
 public class Main
 {
@@ -388,7 +390,7 @@ public class Main
                     if (attrs instanceof PosixFileAttributes)
                         posixAttr = (PosixFileAttributes) attrs;
                     else
-                        posixAttr = Files.getFileAttributeView(file, PosixFileAttributeView.class).readAttributes();
+                        posixAttr = Files.getFileAttributeView(file, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS).readAttributes();
                     user = posixAttr.owner().getName();
                     group = posixAttr.group().getName();
                     permissions = permBits(posixAttr.permissions());
@@ -407,14 +409,13 @@ public class Main
                     // block length
                     // 's' weakSum, strongSum, offset, length
                     // 0 -- end of stream.
+                    if (verbosity > 1)
+                        System.out.printf("%s: emitting file sums.%n", file.toFile());
                     output.write('f');
                     output.writeUTF(user);
                     output.writeUTF(group);
                     output.writeShort(permissions);
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(file));
+                    writeFileAttributes(file, attrs, output);
                     output.writeUTF(file.toFile().getAbsolutePath());
                     // Choose a block size.
                     int blockLength = 0;
@@ -428,6 +429,7 @@ public class Main
                     output.writeInt(blockLength);
                     Configuration config = builder.build();
                     GeneratorStream gen = new GeneratorStream(config);
+                    AtomicInteger sumCount = new AtomicInteger(0);
                     gen.addListener((event) -> {
                         ChecksumLocation loc = event.getChecksumLocation();
                         try
@@ -437,6 +439,7 @@ public class Main
                             output.write(loc.getChecksumPair().getStrong());
                             output.writeLong(loc.getOffset());
                             output.writeLong(loc.getLength());
+                            sumCount.incrementAndGet();
                         }
                         catch (IOException e)
                         {
@@ -481,19 +484,22 @@ public class Main
                         throw new IOException(e);
                     }
                     output.write('i');
-                    output.write(fileHash.digest());
+                    byte[] digest = fileHash.digest();
+                    output.write(digest);
                     output.write(0);
+                    if (verbosity > 1)
+                        System.out.printf("%s: wrote %d sums, MD5: %s%n", file.toFile(), sumCount.get(),
+                                Util.toHexString(digest));
                 }
                 else if (attrs.isSymbolicLink())
                 {
+                    if (verbosity > 1)
+                        System.out.printf("%s: emitting symbolic link%n", file.toFile());
                     output.write('l');
                     output.writeUTF(user);
                     output.writeUTF(group);
                     output.writeShort(permissions);
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(file));
+                    writeFileAttributes(file, attrs, output);
                     output.writeUTF(file.toFile().getAbsolutePath());
                     String target = Files.readSymbolicLink(file).toFile().getPath();
                     output.writeUTF(target);
@@ -505,14 +511,13 @@ public class Main
                     // user, group (UTF-8, length+bytes)
                     // permission string (utf-8, length+bytes)
                     // absolute path (UTF-8, length+bytes)
+                    if (verbosity > 1)
+                        System.out.printf("%s: emitting directory%n", file.toFile());
                     output.write('d');
                     output.writeUTF(user);
                     output.writeUTF(group);
                     output.writeShort(permissions);
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(file));
+                    writeFileAttributes(file, attrs, output);
                     output.writeUTF(file.toFile().getAbsolutePath());
                 }
                 else
@@ -539,6 +544,17 @@ public class Main
                 System.err.printf("skipping non-file, non-folder: %s%n", path);
             }
         }
+    }
+
+    private static void writeFileAttributes(Path file, BasicFileAttributes attrs, DataOutputStream output) throws IOException {
+        output.writeLong(attrs.creationTime().to(TimeUnit.SECONDS));
+        output.writeLong(attrs.lastModifiedTime().to(TimeUnit.SECONDS));
+        if (attrs.isRegularFile() || attrs.isDirectory())
+            output.writeLong(Files.size(file));
+        else if (attrs.isSymbolicLink())
+            output.writeLong(Files.readSymbolicLink(file).toFile().getPath().length());
+        else
+            output.writeLong(0);
     }
 
     static EnumSet<PosixFilePermission> getPerms(short permBits)
@@ -592,19 +608,27 @@ public class Main
             String owner = input.readUTF();
             String group = input.readUTF();
             EnumSet<PosixFilePermission> perms = getPerms(input.readShort());
-            FileTime created = FileTime.fromMillis(input.readLong());
-            FileTime modified = FileTime.fromMillis(input.readLong());
-            FileTime accessed = FileTime.fromMillis(input.readLong());
+            FileTime created = FileTime.from(input.readLong(), TimeUnit.SECONDS);
+            FileTime modified = FileTime.from(input.readLong(), TimeUnit.SECONDS);
             long fileSize = input.readLong();
             Path path = Paths.get(input.readUTF());
 
             if (verbosity > 1)
             {
-                System.out.printf("tag: %c, owner: %s, group: %s, perms: %s, created: %s, modified: %s, accessed: %s, size: %d, path: %s%n",
-                        (char) ch, owner, group, perms, created, modified, accessed, fileSize, path.toFile());
+                System.out.printf("tag: %c, owner: %s, group: %s, perms: %s, created: %s, modified: %s, size: %d, path: %s%n",
+                        (char) ch, owner, group, perms, created, modified, fileSize, path.toFile());
             }
 
-            if (!path.toFile().exists())
+            BasicFileAttributes basicAttrs = null;
+            try
+            {
+                basicAttrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            }
+            catch (NoSuchFileException x)
+            {
+                // skip file not found
+            }
+            if (basicAttrs == null)
             {
                 // Delete
                 if (verbosity > 0)
@@ -624,7 +648,7 @@ public class Main
             if (ch == 'f')
             {
                 int blockLength = input.readInt();
-                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class).readAttributes();
+                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS).readAttributes();
                 if (attrs.isRegularFile())
                 {
                     if (check == DiffCheck.SizeOnly && fileSize == Files.size(path))
@@ -683,10 +707,7 @@ public class Main
                     output.writeUTF(attrs.owner().getName());
                     output.writeUTF(attrs.group().getName());
                     output.writeShort(permBits(attrs.permissions()));
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(path));
+                    writeFileAttributes(path, attrs, output);
                     output.writeUTF(path.toFile().getAbsolutePath());
                     MatcherStream matcherStream = new MatcherStream(builder.blockLength(blockLength).build());
                     matcherStream.addListener((event) -> {
@@ -756,10 +777,7 @@ public class Main
                     output.writeUTF(attrs.owner().getName());
                     output.writeUTF(attrs.group().getName());
                     output.writeShort(permBits(attrs.permissions()));
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(path));
+                    writeFileAttributes(path, attrs, output);
                     output.writeUTF(path.toFile().getAbsolutePath());
                     output.writeUTF(Files.readSymbolicLink(path).toFile().getPath());
                     skipSums(input, hashLength);
@@ -771,10 +789,7 @@ public class Main
                     output.writeUTF(attrs.owner().getName());
                     output.writeUTF(attrs.group().getName());
                     output.writeShort(permBits(attrs.permissions()));
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(path));
+                    writeFileAttributes(path, attrs, output);
                     output.writeUTF(path.toFile().getAbsolutePath());
                     skipSums(input, hashLength);
                 }
@@ -787,7 +802,7 @@ public class Main
             else if (ch == 'l')
             {
                 Path target = Paths.get(input.readUTF());
-                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class).readAttributes();
+                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS).readAttributes();
                 if (attrs.isRegularFile())
                 {
                     // New file, overwriting a symlink.
@@ -795,10 +810,7 @@ public class Main
                     output.writeUTF(attrs.owner().getName());
                     output.writeUTF(attrs.group().getName());
                     output.writeShort(permBits(attrs.permissions()));
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(path));
+                    writeFileAttributes(path, attrs, output);
                     output.writeUTF(path.toFile().getAbsolutePath());
                     InputStream in = Files.newInputStream(path, StandardOpenOption.READ);
                     long total = Files.size(path);
@@ -817,19 +829,25 @@ public class Main
                         || !group.equals(attrs.group().getName())
                         || !perms.equals(attrs.permissions())
                         || !modified.equals(attrs.lastModifiedTime())
-                        || !created.equals(attrs.creationTime())
-                        || !accessed.equals(attrs.lastAccessTime()))
+                        || !created.equals(attrs.creationTime()))
                     {
                         if (verbosity > 0)
                             System.out.printf("%s: update link target to %s.%n", path.toFile(), otherTarget);
+                        if (verbosity > 1)
+                            System.out.printf("  owner: %s vs %s%n" +
+                                            "  group: %s vs %s%n" +
+                                            "  perms: %s vs %s%n" +
+                                            "  modified: %s vs %s%n" +
+                                            "  created: %s vs %s%n",
+                                    owner, attrs.owner().getName(), group, attrs.group().getName(),
+                                    perms, attrs.permissions(),
+                                    modified, attrs.lastModifiedTime(),
+                                    created, attrs.creationTime());
                         output.write('L');
                         output.writeUTF(attrs.owner().getName());
                         output.writeUTF(attrs.group().getName());
                         output.writeShort(permBits(attrs.permissions()));
-                        output.writeLong(attrs.creationTime().toMillis());
-                        output.writeLong(attrs.lastModifiedTime().toMillis());
-                        output.writeLong(attrs.lastAccessTime().toMillis());
-                        output.writeLong(Files.size(path));
+                        writeFileAttributes(path, attrs, output);
                         output.writeUTF(path.toFile().getAbsolutePath());
                         output.writeUTF(otherTarget.toFile().getPath());
                     }
@@ -845,16 +863,13 @@ public class Main
                     output.writeUTF(attrs.owner().getName());
                     output.writeUTF(attrs.group().getName());
                     output.writeShort(permBits(attrs.permissions()));
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(path));
+                    writeFileAttributes(path, attrs, output);
                     output.writeUTF(path.toFile().getAbsolutePath());
                 }
             }
             else if (ch == 'd')
             {
-                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class).readAttributes();
+                PosixFileAttributes attrs = Files.getFileAttributeView(path, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS).readAttributes();
                 if (attrs.isRegularFile())
                 {
                     // New file, overwriting a directory.
@@ -862,10 +877,7 @@ public class Main
                     output.writeUTF(attrs.owner().getName());
                     output.writeUTF(attrs.group().getName());
                     output.writeShort(permBits(attrs.permissions()));
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(path));
+                    writeFileAttributes(path, attrs, output);
                     output.writeUTF(path.toFile().getAbsolutePath());
                     InputStream in = Files.newInputStream(path, StandardOpenOption.READ);
                     long total = Files.size(path);
@@ -883,10 +895,7 @@ public class Main
                     output.writeUTF(attrs.owner().getName());
                     output.writeUTF(attrs.group().getName());
                     output.writeShort(permBits(attrs.permissions()));
-                    output.writeLong(attrs.creationTime().toMillis());
-                    output.writeLong(attrs.lastModifiedTime().toMillis());
-                    output.writeLong(attrs.lastAccessTime().toMillis());
-                    output.writeLong(Files.size(path));
+                    writeFileAttributes(path, attrs, output);
                     output.writeUTF(path.toFile().getAbsolutePath());
                     output.writeUTF(Files.readSymbolicLink(path).toFile().getPath());
                 }
@@ -896,17 +905,25 @@ public class Main
                         || !group.equals(attrs.group().getName())
                         || !perms.equals(attrs.permissions())
                         || !modified.equals(attrs.lastModifiedTime())
-                        || !created.equals(attrs.creationTime())
-                        || !accessed.equals(attrs.lastAccessTime()))
+                        || !created.equals(attrs.creationTime()))
                     {
+                        if (verbosity > 0)
+                            System.out.printf("%s: updating directory metadata%n", path.toFile());
+                        if (verbosity > 1)
+                            System.out.printf("  owner: %s vs %s%n" +
+                                              "  group: %s vs %s%n" +
+                                              "  perms: %s vs %s%n" +
+                                              "  modified: %s vs %s%n" +
+                                              "  created: %s vs %s%n",
+                                              owner, attrs.owner().getName(), group, attrs.group().getName(),
+                                              perms, attrs.permissions(),
+                                              modified, attrs.lastModifiedTime(),
+                                              created, attrs.creationTime());
                         output.write('D');
                         output.writeUTF(attrs.owner().getName());
                         output.writeUTF(attrs.group().getName());
                         output.writeShort(permBits(attrs.permissions()));
-                        output.writeLong(attrs.creationTime().toMillis());
-                        output.writeLong(attrs.lastModifiedTime().toMillis());
-                        output.writeLong(attrs.lastAccessTime().toMillis());
-                        output.writeLong(Files.size(path));
+                        writeFileAttributes(path, attrs, output);
                         output.writeUTF(path.toFile().getAbsolutePath());
                     }
                 }

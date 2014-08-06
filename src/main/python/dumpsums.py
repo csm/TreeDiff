@@ -14,6 +14,10 @@ def readutf(i):
     return unicode(utf)
 
 
+def readshort(i):
+    return struct.unpack('>H', i.read(2))[0]
+
+
 def readint(i):
     return struct.unpack('>I', i.read(4))[0]
 
@@ -36,7 +40,10 @@ while True:
         print 'File entry'
         print '  User:', readutf(sys.stdin)
         print '  Group:', readutf(sys.stdin)
-        print '  Perms:', readutf(sys.stdin)
+        print '  Perms:', bin(readshort(sys.stdin))
+        print '  Created:', readlong(sys.stdin)
+        print '  Modified:', readlong(sys.stdin)
+        print '  Length:', readlong(sys.stdin)
         print '  Path:', readutf(sys.stdin)
         print '  Block length:', readint(sys.stdin)
         print '  Sums:'
@@ -50,6 +57,9 @@ while True:
                 print '    weak=%s, strong=%s, offset=%d, length=%d' % (weak,
                                                                         ''.join(map(lambda c: '%02x' % ord(c), strong)),
                                                                         offset, length)
+            elif x[0] == 'i':
+                md5 = sys.stdin.read(16)
+                print '  File MD5:', ''.join(map(lambda c: '%02x' % ord(c), md5))
             elif ord(x[0]) == 0:
                 break
             else:
@@ -58,14 +68,20 @@ while True:
         print 'Symlink entry'
         print '  User:', readutf(sys.stdin)
         print '  Group:', readutf(sys.stdin)
-        print '  Perms:', readutf(sys.stdin)
+        print '  Perms:', bin(readshort(sys.stdin))
+        print '  Created:', readlong(sys.stdin)
+        print '  Modified:', readlong(sys.stdin)
+        print '  Length:', readlong(sys.stdin)
         print '  Path:', readutf(sys.stdin)
         print '  Target:', readutf(sys.stdin)
     elif x[0] == 'd':
         print 'Directory entry'
         print '  User:', readutf(sys.stdin)
         print '  Group:', readutf(sys.stdin)
-        print '  Perms:', readutf(sys.stdin)
+        print '  Perms:', bin(readshort(sys.stdin))
+        print '  Created:', readlong(sys.stdin)
+        print '  Modified:', readlong(sys.stdin)
+        print '  Length:', readlong(sys.stdin)
         print '  Path:', readutf(sys.stdin)
     else:
         print 'unknown tag %r' % x[0]
